@@ -512,17 +512,17 @@ def render_live_pipeline(state: ResearchState, elapsed: float, log: list[str]) -
 
 def run_multi_live(query: str) -> None:
     """Chạy graph trong thread nền, stream từng node lên UI (poll mỗi 0.25s)."""
-    snapshots: list[ResearchState] = []
+    # Snapshot đầu tiên tạo NGAY ở main thread để không bao giờ đọc list rỗng
+    # (thread nền có thể chưa kịp append khi main đã vào vòng poll).
+    snapshots: list[ResearchState] = [ResearchState(request=ResearchQuery(query=query))]
     error: list[str] = []
     finished = threading.Event()
 
     def worker() -> None:
         try:
             workflow = MultiAgentWorkflow()
-            initial = ResearchState(request=ResearchQuery(query=query))
-            snapshots.append(initial)
-            for update in workflow.stream(initial):
-                for node_name, state_dict in update.items():
+            for update in workflow.stream(snapshots[0]):
+                for _node_name, state_dict in update.items():
                     snapshots.append(ResearchState.model_validate(state_dict))
         except Exception as exc:  # lỗi hiển thị rõ trong UI, không crash app
             error.append(str(exc))
@@ -533,9 +533,7 @@ def run_multi_live(query: str) -> None:
 
     started = perf_counter()
     box = st.empty()
-    idx = 0
     while not finished.is_set():
-        idx = len(snapshots)
         latest = snapshots[-1]
         log = []
         for route in latest.route_history:
