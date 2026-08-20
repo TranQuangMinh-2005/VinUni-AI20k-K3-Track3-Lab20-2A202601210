@@ -7,16 +7,20 @@ Chạy bằng:  streamlit run app.py
 """
 
 import html
+import threading
+import time
 from time import perf_counter
 
 import streamlit as st
 
 from multi_agent_research_lab.core.config import get_settings
+from multi_agent_research_lab.core.schemas import ResearchQuery
 from multi_agent_research_lab.core.state import ResearchState
 from multi_agent_research_lab.evaluation.benchmark import (
     make_baseline_runner,
     make_multi_agent_runner,
 )
+from multi_agent_research_lab.graph.workflow import MultiAgentWorkflow
 from multi_agent_research_lab.observability.logging import configure_logging
 from multi_agent_research_lab.observability.tracing import setup_tracing
 
@@ -167,6 +171,34 @@ h1.display .grad { background: linear-gradient(100deg, #f4f4f5 30%, #a78bfa 65%,
                    box-shadow: 0 0 12px rgba(139,92,246,0.55); }
 .tl-item .t { font-weight: 600; color: #e4e4e7; font-size: 13px; }
 .tl-item .p { font-size: 11px; color: #71717a; margin-top: 2px; word-break: break-word; }
+
+/* --- Live pipeline --- */
+.pipe { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0;
+        padding: 10px 0 4px; }
+.pnode { position: relative; display: flex; flex-direction: column; align-items: center;
+         min-width: 148px; padding: 16px 20px; border-radius: 20px;
+         background: rgba(255,255,255,0.03); border: 1px solid var(--hairline);
+         transition: all .7s var(--ease); }
+.pnode .glyph { font-size: 19px; font-weight: 300; margin-bottom: 5px; color: var(--text); }
+.pnode .who { font-family: 'Clash Display', sans-serif; font-weight: 600; font-size: 14px; }
+.pnode .pstage-meta { font-size: 10px; color: #71717a; margin-top: 5px; min-height: 13px; }
+.pnode.idle { opacity: 0.4; }
+.pnode.idle .glyph { opacity: 0.5; }
+.pnode.on { border-color: rgba(139,92,246,0.75); background: rgba(139,92,246,0.09); }
+.pnode.on .glow { position: absolute; inset: -2px; border-radius: 22px; pointer-events: none;
+                  box-shadow: 0 0 34px rgba(139,92,246,0.45); opacity: .5;
+                  animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: .25; } 50% { opacity: .85; } }
+.pnode.done { border-color: rgba(52,211,153,0.38); background: rgba(52,211,153,0.07); opacity: 1; }
+.pnode.done .glyph { color: var(--emerald); }
+.pconn { width: 36px; height: 1px; background: rgba(255,255,255,0.12); margin: 0 2px;
+         transition: background .9s var(--ease); }
+.pconn.lit { background: linear-gradient(90deg, rgba(139,92,246,0.85), rgba(52,211,153,0.6)); }
+.live-line { text-align: center; margin-top: 14px; color: #a1a1aa; font-size: 12.5px;
+             letter-spacing: 0.02em; }
+.live-line b { color: #c4b5fd; font-weight: 600; }
+.live-log { margin-top: 12px; font-size: 11.5px; color: #71717a; line-height: 1.8; }
+.live-log span { color: #52525b; margin-right: 6px; font-variant-numeric: tabular-nums; }
 
 /* --- Error banner --- */
 .err { border-radius: 16px; padding: 16px 20px; margin-top: 14px;
@@ -376,6 +408,161 @@ def render_result(run_key: str, state: ResearchState, latency: float) -> None:
 
 
 # ------------------------------------------------------------------------------------
+# Live pipeline (multi-agent): node nào đang chạy thì bật sáng, xong thì sáng xanh
+# ------------------------------------------------------------------------------------
+def stage_status(state: ResearchState) -> dict[str, str]:
+    """Suy ra trạng thái từng node (idle/on/done) từ snapshot state hiện tại."""
+    status = {
+        "supervisor": "on",
+        "researcher": "idle",
+        "analyst": "idle",
+        "writer": "idle",
+        "done": "idle",
+    }
+    research_done = bool(state.sources and state.research_notes)
+    analysis_done = bool(state.analysis_notes)
+    writer_done = bool(state.final_answer)
+    complete = bool(state.route_history and state.route_history[-1] == "done")
+
+    if research_done:
+        status["researcher"] = "done"
+    if analysis_done:
+        status["analyst"] = "done"
+    if writer_done:
+        status["writer"] = "done"
+    if complete:
+        status["supervisor"] = "done"
+        status["done"] = "done"
+        return status
+
+    # Worker vừa được supervisor route → node đó đang chạy (bật sáng);
+    # supervisor nghỉ. Worker xong → supervisor "thức dậy" route tiếp.
+    worker = state.next_agent if state.next_agent in ("researcher", "analyst", "writer") else None
+    if worker:
+        if status[worker] == "done":
+            status["supervisor"] = "on"
+        else:
+            status["supervisor"] = "done"
+            status[worker] = "on"
+    return status
+
+
+def stage_times(state: ResearchState) -> dict[str, float]:
+    """Latency từng agent lấy từ trace events (latency_seconds)."""
+    times: dict[str, float] = {}
+    for event in state.trace:
+        name = event["name"]
+        lat = event.get("payload", {}).get("latency_seconds")
+        if lat is None:
+            continue
+        if name == "researcher_llm":
+            times["researcher"] = float(lat)
+        elif name == "analyst_llm":
+            times["analyst"] = float(lat)
+        elif name == "writer_llm":
+            times["writer"] = float(lat)
+    return times
+
+
+def activity_label(status: dict[str, str]) -> str:
+    if status["researcher"] == "on":
+        return "<b>Researcher</b> is searching the web and taking notes…"
+    if status["analyst"] == "on":
+        return "<b>Analyst</b> is weighing the evidence…"
+    if status["writer"] == "on":
+        return "<b>Writer</b> is composing the final answer…"
+    if status["done"] == "done":
+        return "Pipeline <b>complete</b>"
+    return "<b>Supervisor</b> is deciding the next move…"
+
+
+def render_live_pipeline(state: ResearchState, elapsed: float, log: list[str]) -> str:
+    """HTML pipeline live: node đang chạy phát sáng tím, node xong sáng xanh."""
+    status = stage_status(state)
+    times = stage_times(state)
+    nodes = [
+        ("supervisor", "◈", "Supervisor"),
+        ("researcher", "◐", "Researcher"),
+        ("analyst", "◒", "Analyst"),
+        ("writer", "◓", "Writer"),
+        ("done", "✓", "Complete"),
+    ]
+    parts = ['<div class="pipe">']
+    for i, (key, glyph, name) in enumerate(nodes):
+        meta = f"{times[key]:.1f}s" if key in times else "&nbsp;"
+        parts.append(
+            f'<div class="pnode {status[key]}"><span class="glow"></span>'
+            f'<div class="glyph">{glyph}</div><div class="who">{name}</div>'
+            f'<div class="pstage-meta">{meta}</div></div>'
+        )
+        if i < len(nodes) - 1:
+            nxt = nodes[i + 1][0]
+            lit = " lit" if status[key] == "done" and status[nxt] in ("done", "on") else ""
+            parts.append(f'<span class="pconn{lit}"></span>')
+    parts.append("</div>")
+    parts.append(f'<div class="live-line">{activity_label(status)} · {elapsed:.1f}s</div>')
+    if log:
+        parts.append(
+            '<div class="live-log">'
+            + "".join(f'<div><span>[{i+1:02d}]</span>{html.escape(line)}</div>' for i, line in enumerate(log[-6:]))
+            + "</div>"
+        )
+    return "".join(parts)
+
+
+def run_multi_live(query: str) -> None:
+    """Chạy graph trong thread nền, stream từng node lên UI (poll mỗi 0.25s)."""
+    snapshots: list[ResearchState] = []
+    error: list[str] = []
+    finished = threading.Event()
+
+    def worker() -> None:
+        try:
+            workflow = MultiAgentWorkflow()
+            initial = ResearchState(request=ResearchQuery(query=query))
+            snapshots.append(initial)
+            for update in workflow.stream(initial):
+                for node_name, state_dict in update.items():
+                    snapshots.append(ResearchState.model_validate(state_dict))
+        except Exception as exc:  # lỗi hiển thị rõ trong UI, không crash app
+            error.append(str(exc))
+        finally:
+            finished.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    started = perf_counter()
+    box = st.empty()
+    idx = 0
+    while not finished.is_set():
+        idx = len(snapshots)
+        latest = snapshots[-1]
+        log = []
+        for route in latest.route_history:
+            if route != "done":
+                log.append(f"Supervisor routed to {route}")
+            else:
+                log.append("Supervisor stopped the pipeline")
+        box.markdown(
+            render_live_pipeline(latest, perf_counter() - started, log),
+            unsafe_allow_html=True,
+        )
+        time.sleep(0.25)
+
+    if error:
+        box.empty()
+        st.session_state["multi"] = {"error": error[0]}
+        return
+    latest = snapshots[-1]
+    st.session_state["multi"] = {"state": latest, "latency": perf_counter() - started}
+    box.markdown(
+        render_live_pipeline(latest, perf_counter() - started, log),
+        unsafe_allow_html=True,
+    )
+    st.rerun()
+
+
+# ------------------------------------------------------------------------------------
 # Header + hero
 # ------------------------------------------------------------------------------------
 st.markdown(
@@ -419,13 +606,7 @@ if run_baseline:
             st.session_state["baseline"] = {"error": str(exc)}
 
 if run_multi:
-    with st.spinner("Supervisor is orchestrating the pipeline…"):
-        started = perf_counter()
-        try:
-            state = make_multi_agent_runner()(query)
-            st.session_state["multi"] = {"state": state, "latency": perf_counter() - started}
-        except Exception as exc:
-            st.session_state["multi"] = {"error": str(exc)}
+    run_multi_live(query)
 
 base = st.session_state.get("baseline")
 multi = st.session_state.get("multi")

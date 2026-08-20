@@ -74,3 +74,35 @@ def test_workflow_guardrail_stops_runaway_loop() -> None:
     assert state.route_history[-1] == "done"
     assert any("max_iterations" in err for err in state.errors)
     assert state.final_answer is None
+
+
+def test_workflow_stream_yields_per_node_updates() -> None:
+    # Stream mode: mỗi node hoàn thành là 1 update — đây là cơ chế cho UI live pipeline
+    llm = ScriptedLLM(
+        [
+            '{"next": "researcher", "reason": "no sources yet"}',
+            "GraphRAG uses knowledge graphs [1].",
+            '{"next": "analyst", "reason": "notes ready"}',
+            "Key claims: ...",
+            '{"next": "writer", "reason": "analysis ready"}',
+            "GraphRAG is a graph-based RAG approach [1].",
+            '{"next": "done", "reason": "answer complete"}',
+        ]
+    )
+    workflow = MultiAgentWorkflow(
+        settings=Settings(MAX_ITERATIONS=10), llm_client=llm, search_client=FakeSearch()
+    )
+    initial = ResearchState(request=ResearchQuery(query="What is GraphRAG?"))
+    updates = list(workflow.stream(initial))
+
+    # Mỗi update là dict {node_name: state_snapshot}
+    assert updates and all(isinstance(u, dict) for u in updates)
+    node_names = [next(iter(u)) for u in updates]
+    assert "supervisor" in node_names
+    assert "researcher" in node_names
+    assert "writer" in node_names
+
+    # Snapshot cuối cùng chứa đủ kết quả (validate được thành ResearchState)
+    final_snapshot = next(iter(updates[-1].values()))
+    final_state = ResearchState.model_validate(final_snapshot)
+    assert final_state.final_answer is not None

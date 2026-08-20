@@ -23,7 +23,7 @@ BONUS — bật CriticAgent (đã implement trong agents/critic.py) trong graph:
 """
 
 import logging
-from collections.abc import Hashable
+from collections.abc import Hashable, Iterator
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -125,6 +125,18 @@ class MultiAgentWorkflow:
         result = self._graph.invoke(state, config={"recursion_limit": recursion_limit})
         # invoke trả dict → validate lại thành ResearchState để có object đầy đủ
         return ResearchState.model_validate(result)
+
+    def stream(self, state: ResearchState) -> Iterator[dict[str, Any]]:
+        """Stream từng super-step của graph — phục vụ UI hiển thị tiến trình live.
+
+        Mỗi lần yield: `{tên_node: state_snapshot_dạng_dict}` ngay khi node đó
+        hoàn thành. UI có thể validate snapshot thành ResearchState để đọc
+        route_history / notes / final_answer và bật sáng node tương ứng.
+        """
+        recursion_limit = self._settings.max_iterations * 2 + 10
+        yield from self._graph.stream(
+            state, config={"recursion_limit": recursion_limit}, stream_mode="updates"
+        )
 
     # ---------- Node functions ----------
     # Mỗi method là một node của graph. Chúng chỉ làm việc "đóng gói":
