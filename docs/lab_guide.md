@@ -115,3 +115,18 @@ Mỗi nhóm trả lời 2 câu:
 
 1. Case nào nên dùng multi-agent? Vì sao?
 2. Case nào không nên dùng multi-agent? Vì sao?
+
+### Trả lời (đã điền — tham khảo số liệu trong reports/benchmark_report.md)
+
+1. **Nên dùng multi-agent khi:**
+   - Task cần **nguồn kiểm chứng** (research, fact-check, so sánh thông tin): benchmark cho thấy multi-agent đạt citation coverage 90% còn single-agent là 0% vì không có bước search.
+   - Task có **các bước tách biệt rõ** (search → phân tích → viết): mỗi agent có prompt ngắn, vai trò hẹp nên ít loãng context hơn một prompt khổng lồ.
+   - Cần **debug & trace từng khâu**: khi output sai, mở trace thấy ngay sai ở researcher hay analyst; single-agent chỉ có 1 span nên khó truy.
+   - Cần **guardrail/retry độc lập**: một agent fail có thể retry mà không phải sinh lại toàn bộ câu trả lời.
+   - Chấp nhận đánh đổi: chậm hơn ~2.8x và đắt hơn ~4x (theo benchmark của lab).
+
+2. **Không nên dùng multi-agent khi:**
+   - Câu hỏi **đơn giản, 1 lượt sinh văn bản là đủ** (tóm tắt, dịch, trả lời từ knowledge nội tại): multi-agent chỉ thêm latency + token mà không thêm giá trị.
+   - **Latency sống còn** (chat thời gian thực, autocomplete): 21s vs 7.5s là khác biệt trải nghiệm rõ rệt.
+   - **Chi phí token cực kỳ nhạy cảm** (free tier, hàng triệu query/ngày): 7 lần gọi LLM mỗi request nhân lên rất nhanh.
+   - Workflow quá **đơn giản để tách vai**: thêm agent chỉ vì "cho giống multi-agent" vi phạm đúng nguyên tắc đầu tiên của lab — không thêm agent nếu không có lý do rõ ràng.
